@@ -1,10 +1,10 @@
 # AI PC Builder — Authentication & Session Technical Design
 
 **Document ID:** SEC-002.1  
-**Version:** 1.0.1  
+**Version:** 1.0.2  
 **Status:** Proposed — Awaiting Review  
 **Path:** `docs/04-security/designs/01-authentication-session-design.md`  
-**Related:** SEC-001, SEC-002, SEC-002-ADR, ARCH-004  
+**Related:** SEC-001, SEC-002, SEC-002-ADR, SEC-002.2, SEC-002.4, ARCH-004, SEC-INT-001  
 **Scope:** Identity module and browser authentication; not payment webhooks or service-to-service authentication.
 
 ## 1. Goals and security invariants
@@ -70,32 +70,54 @@ flowchart TB
 
 **Responsibilities:** `TokenService` creates/verifies cryptographic credentials; `SessionService` is authoritative for active/revoked status and refresh rotation; `AuthController` handles HTTP and cookie transport; authorization policies protect operations and resources after authentication.
 
-## 4. Login sequence
+## 4. CSRF bootstrap and login sequence
+
+**Canonical behavior:** SEC-002.2 sections 5–7 define the CSRF bootstrap, Origin validation, cookie attributes, and CSRF token lifecycle. This diagram integrates those requirements with Identity login. The HTTP request/response contract will be finalized in ARCH-005.
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant B as Browser
+    participant B as Next.js Browser
     participant C as AuthController
+    participant X as CSRF Service
     participant A as AuthenticationService
     participant DB as PostgreSQL
     participant T as TokenService
-    B->>C: POST /api/v1/auth/login
-    C->>C: Validate input and Origin policy
-    C->>A: Authenticate credentials
-    A->>DB: Load user and password hash
-    alt Invalid credentials or disabled user
-      A-->>C: Authentication failed
-      C-->>B: 401 generic error
-    else Valid credentials
-      A->>DB: Create active session and refresh-token hash
-      A->>T: Issue signed access JWT
-      A-->>C: Access JWT + opaque refresh token + CSRF token
-      C-->>B: Access JWT in response body and refresh cookie and CSRF token
+    B->>C: GET /api/v1/auth/csrf
+    C->>X: Issue anonymous bootstrap context
+    X->>DB: Store bootstrap token hash and expiry
+    DB-->>X: Context persisted
+    X-->>C: Bootstrap cookie and CSRF token
+    C-->>B: 200 with cookie and token and no-store
+    B->>C: POST /api/v1/auth/login with cookie and CSRF header
+    C->>X: Validate Origin and bootstrap proof
+    alt Invalid or expired bootstrap proof
+        X-->>C: Reject request
+        C-->>B: 403 Forbidden
+    else Valid bootstrap proof
+        C->>A: Authenticate credentials
+        A->>DB: Read user and password hash
+        alt Invalid credentials or disabled account
+            A-->>C: Authentication failed
+            C-->>B: 401 generic error
+        else Valid credentials
+            A->>DB: Atomically consume bootstrap and create session
+            A->>DB: Persist refresh hash and session CSRF hash
+            A->>T: Issue signed access JWT
+            T-->>A: Access JWT
+            A-->>C: JWT and refresh credential and session CSRF token
+            C-->>B: 200 with JWT and CSRF token and refresh cookie
+        end
     end
 ```
 
-Login must use secure password hashing, rate limiting and non-enumerating errors. Session creation must be committed before successful login is reported. CSRF bootstrap and login-CSRF protection are specified in SEC-002.2.
+**Behavioral requirements:**
+- `GET /auth/csrf` is anonymous, rate-limited as appropriate, returns `Cache-Control: no-store`, and issues a short-lived bootstrap context; it is not proof of identity.
+- `POST /auth/login` requires an allowed Origin, bootstrap cookie, and matching `X-CSRF-Token`. Missing, expired, or mismatched proof is rejected before credentials can establish a session.
+- Successful login consumes the bootstrap context and creates a new authenticated session-bound CSRF token. The bootstrap cookie is cleared or invalidated as specified by SEC-002.2.
+- Invalid credentials return a non-enumerating error. The design must explicitly decide whether failed attempts consume bootstrap contexts; this is **open** and must be consistent in SEC-002.2 and ARCH-005.
+- Session and refresh-token persistence must commit before a successful login response is returned. CSRF bootstrap consumption and session creation must not permit the same bootstrap context to create multiple sessions concurrently.
+- Authentication credentials, cookies, and CSRF tokens must not appear in application or audit logs.
 
 ## 5. Protected request and revocation sequence
 
@@ -269,8 +291,9 @@ erDiagram
 
 | Operation | Endpoint | Auth / CSRF | Expected behavior |
 |---|---|---|---|
-| Register | `POST /api/v1/auth/register` | Public; input validation, anti-abuse | Create customer account |
-| Login | `POST /api/v1/auth/login` | Public; Origin/login-CSRF policy, rate limit | Establish session; return access JWT; set refresh cookie |
+| Register | `POST /api/v1/auth/register` | Public; input validation and anti-abuse; registration CSRF policy to be defined | Create customer account |
+| CSRF bootstrap | `GET /api/v1/auth/csrf` | Anonymous; allowed Origin and no-store response | Issue bootstrap cookie and anonymous CSRF token |
+| Login | `POST /api/v1/auth/login` | Anonymous credentials; allowed Origin, bootstrap cookie and matching CSRF header, rate limit | Consume bootstrap; establish session; return access JWT and session CSRF token; set refresh cookie |
 | Refresh | `POST /api/v1/auth/refresh` | Refresh cookie + Origin + CSRF token | Atomic rotation; issue new credentials |
 | Logout | `POST /api/v1/auth/logout` | Authenticated session and/or validated refresh-cookie flow; CSRF | Revoke current session; clear cookie |
 | Logout all | `POST /api/v1/auth/logout-all` | Valid access JWT + session, CSRF if cookies are used | Revoke all user's sessions |
@@ -314,7 +337,7 @@ Use test-only users and tokens. No external service or third-party environment i
 ## 13. Open decisions
 
 1. Signing algorithm and signing-key rotation.
-2. CSRF bootstrap for login and unauthenticated browser flows (SEC-002.2).
+2. Registration CSRF policy and bootstrap consumption behavior after failed credentials (coordinate with SEC-002.2).
 3. Deployment topology, cookie Domain/Path and CORS allowlist.
 4. Cross-tab refresh coordination and lost-response UX.
 5. Exact session/refresh expiry, cleanup and audit retention.
@@ -326,7 +349,7 @@ Use test-only users and tokens. No external service or third-party environment i
 - [ ] Architecture, login, protected request, refresh and revoke diagrams reviewed.
 - [ ] Session/token state machines reviewed.
 - [ ] Persistence model reviewed with ARCH-004.
-- [ ] CSRF dependencies linked to SEC-002.2.
+- [x] CSRF bootstrap/login dependency aligned with SEC-002.2 (design only).
 - [ ] Concurrency, replay and failure cases accepted.
 - [ ] Security test matrix approved.
 - [ ] Open decisions tracked in project status.
