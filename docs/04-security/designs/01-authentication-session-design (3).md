@@ -1,7 +1,7 @@
 # AI PC Builder — Authentication & Session Technical Design
 
 **Document ID:** SEC-002.1  
-**Version:** 1.0.2  
+**Version:** 1.0.3  
 **Status:** Proposed — Awaiting Review  
 **Path:** `docs/04-security/designs/01-authentication-session-design.md`  
 **Related:** SEC-001, SEC-002, SEC-002-ADR, SEC-002.2, SEC-002.4, ARCH-004, SEC-INT-001  
@@ -238,6 +238,9 @@ stateDiagram-v2
 
 ## 9. Proposed persistence schema
 
+**Schema authority:** The ERD below is illustrative. `docs/03-system-design/04-database-design.md` (ARCH-004) is the canonical consolidated database contract. Use SEC-002.4 for the canonical audit event fields, not the abbreviated audit entity below.
+
+
 ```mermaid
 erDiagram
     USERS ||--o{ AUTH_SESSIONS : owns
@@ -334,12 +337,133 @@ Detailed status codes, DTOs, error bodies, cookie Path, CSRF bootstrap, and pre-
 
 Use test-only users and tokens. No external service or third-party environment is required.
 
+## 12A. Refresh concurrency and lost-response policy (SEC-INT-003)
+
+**Design status:** Proposed. This section integrates SEC-INT-003 into the canonical Authentication design. It does not assert successful implementation.
+
+### 12.1 Decision
+
+The MVP uses **strict, single-use opaque refresh tokens** with server-side PostgreSQL session authority and atomic rotation. A refresh token previously consumed must never produce new credentials. On a **verified replay of a known consumed token**, revoke its session/token family and require a new login; this conservative policy can log out legitimate users when responses are lost or tabs race. Treat that as an explicit MVP trade-off, not as proof of compromise.
+
+The frontend implements:
+- **In-tab single-flight:** all requests awaiting renewal share one in-flight refresh Promise.
+- **Cross-tab best-effort coordination:** use `BroadcastChannel` to notify other same-origin tabs of refresh start/end and a short-lived localStorage lease with owner ID and expiry to reduce duplicate refresh. The lease is **not a security boundary**, not a distributed mutex, and does not guarantee exactly-once delivery.
+- **No token sharing between tabs:** never broadcast access JWTs, refresh tokens, CSRF secrets, or credential-bearing responses. Broadcast only non-sensitive status (`refresh-started`, `refresh-finished`, `reauth-required`) and a correlation nonce.
+- **Cookie and CSRF:** refresh cookie remains HttpOnly; session-bound CSRF token stays in memory and does not rotate on normal refresh. On a full page reload, obtain a session-bound CSRF token via an authenticated, Origin-checked bootstrap/recovery endpoint defined in ARCH-005. The existing anonymous `GET /auth/csrf` is **not** sufficient for recovering an authenticated session CSRF token. This endpoint and proof-of-session mechanism remain a blocking contract decision.
+- **Fallback:** if coordination is unavailable or times out, a tab may attempt refresh once. The server remains authoritative and strict.
+
+### 12.2 Server rotation algorithm
+
+1. Validate allowed Origin and session-bound CSRF proof before any mutation; fail 403 without consuming refresh token if invalid.
+2. Parse the opaque refresh cookie, compute its keyed hash, and resolve token/session without logging secrets.
+3. Begin transaction; lock the session row `FOR UPDATE`; reload the token record under the lock.
+4. Reject revoked/expired session or expired credential. For a token marked `CONSUMED`, emit sanitized replay audit, revoke session/family in the same transaction, and return a generic 401.
+5. Require `status=CURRENT` **and** `auth_sessions.current_refresh_token_id = presented.id`; otherwise reject without issuing credentials.
+6. Mark current token `CONSUMED`, create new `CURRENT` record, set `replaced_by_token_id` and session current pointer; emit critical audit event; commit.
+7. Only after successful commit, send new HttpOnly cookie and short-lived access token. Never return a token before commit.
+
+**Concurrency invariant:** exactly one committed successor token per session rotation. Do not treat `SELECT FOR UPDATE` as sufficient without state re-check after acquiring lock.
+
+### 12.3 State and error semantics
+
+| Situation | Server response | Client response |
+|---|---|---|
+| Current valid refresh + CSRF | 200, rotated cookie + access token | Resolve waiting requests |
+| Missing/invalid Origin or CSRF | 403; no rotation | Stop and surface security/session recovery |
+| Expired session or invalid unknown token | 401; no credentials | Clear in-memory auth; sign in |
+| Known consumed token replay | 401; revoke affected session/family | Sign in; show generic session-expired message |
+| Network failure before request reaches server | No mutation | Retry **only** when known not submitted; otherwise treat outcome as unknown |
+| Response lost after successful commit | Cookie update may not reach browser | Do not blindly replay old cookie; clear local state and ask user to sign in |
+| Another tab already rotated | Old cookie may be invalid or updated | Wait for coordination signal; re-check auth state without assuming a safe retry |
+| Database unavailable | 503; no rotation committed | Temporary error; no silent success |
+
+Do not claim a generic automatic retry is safe: a POST may commit even if the client never receives the response. Do not add a server grace window that accepts consumed tokens without a separate design review.
+
+### 12.4 Browser workflow
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant T1 as Tab A
+    participant T2 as Tab B
+    participant API as NestJS
+    participant DB as PostgreSQL
+    T1->>T1: Acquire best-effort refresh lease
+    T1-->>T2: Broadcast refresh-started
+    T2->>T2: Wait for completion signal
+    T1->>API: POST refresh + CSRF + HttpOnly cookie
+    API->>DB: Lock session and rotate atomically
+    DB-->>API: Commit successor token
+    API-->>T1: 200 and Set-Cookie
+    T1-->>T2: Broadcast refresh-finished
+    T2->>T2: Recheck session state and resume requests
+    Note over T1,T2: Broadcast carries no tokens or CSRF secrets
+```
+
+**Important limitation:** a second tab may lack a usable access JWT or CSRF token. `refresh-finished` is a coordination hint, **not** an authentication proof. The second tab must use a separately designed safe session-recovery flow rather than assuming it can access Tab A's in-memory access token.
+
+### 12.5 Lost-response handling
+
+```mermaid
+flowchart TD
+    A["Refresh POST sent"] --> B{"Response received?"}
+    B -->|Yes, 200| C["Use new access token"]
+    B -->|Yes, 401| D["Clear auth state and sign in"]
+    B -->|Yes, 403| E["Stop and resolve CSRF/Origin failure"]
+    B -->|No or uncertain| F["Outcome unknown"]
+    F --> G["Do not automatically replay consumed credential"]
+    G --> H["Require sign-in or approved safe recovery protocol"]
+```
+
+**Cookie race:** browser `Set-Cookie` from a successful response is not guaranteed to be visible to every tab immediately. Treat cross-tab timing as best-effort only. Tests must include duplicate response ordering, page reload and tab closure.
+
+### 12.6 Frontend design sketch (pseudocode)
+
+```ts
+let inFlightRefresh: Promise<void> | null = null;
+
+function refreshOnce(): Promise<void> {
+  if (inFlightRefresh) return inFlightRefresh;
+
+  inFlightRefresh = performCoordinatedRefresh()
+    .finally(() => {
+      inFlightRefresh = null;
+    });
+
+  return inFlightRefresh;
+}
+```
+
+`performCoordinatedRefresh()` must validate local CSRF availability, coordinate tabs without transmitting secrets, issue at most one refresh request for this tab's attempt, and handle unknown outcomes without blind retries. This sketch is **not production-ready code**.
+
+### 12.7 Verification matrix
+
+| ID | Scenario | Expected result |
+|---|---|---|
+| SEC-REF-001 | 20 same-tab API requests need refresh | One refresh POST |
+| SEC-REF-002 | Two concurrent refresh POSTs use same token | At most one rotation commits; replay policy applied to loser |
+| SEC-REF-003 | Two tabs coordinate normally | One refresh POST in normal case |
+| SEC-REF-004 | Tabs start together without coordination | Server preserves single-use invariant; re-login may be required |
+| SEC-REF-005 | Refresh response lost after DB commit | No automatic retry of stale token |
+| SEC-REF-006 | Request fails before reaching server | Safe retry only when failure-before-send is certain |
+| SEC-REF-007 | CSRF invalid | 403 and no token consumed |
+| SEC-REF-008 | Session revoked during refresh | No new valid session credentials |
+| SEC-REF-009 | Browser reload loses access JWT and CSRF | Recovery blocked until approved contract implemented |
+| SEC-REF-010 | BroadcastChannel unsupported | Security remains intact; degraded UX |
+| SEC-REF-011 | Refresh fails mid-transaction | No half-rotated token |
+| SEC-REF-012 | Logs/telemetry capture requests | No refresh tokens, CSRF tokens or JWTs logged |
+
+Use Vitest + Supertest with real PostgreSQL transactions for server concurrency and Playwright or equivalent browser tests for multi-tab/cookie behavior. No verification has been executed.
+
+
+**API contract prerequisite:** The anonymous `GET /auth/csrf` bootstrap is not a way to recover session-bound CSRF after reload. For MVP, require explicit re-login after reload/unknown refresh outcome unless ARCH-005 defines a separate secure authenticated recovery contract.
+
 ## 13. Open decisions
 
 1. Signing algorithm and signing-key rotation.
 2. Registration CSRF policy and bootstrap consumption behavior after failed credentials (coordinate with SEC-002.2).
 3. Deployment topology, cookie Domain/Path and CORS allowlist.
-4. Cross-tab refresh coordination and lost-response UX.
+4. Authenticated CSRF/session recovery after reload; MVP defaults to re-login. Cross-tab coordination is best-effort, not a security guarantee.
 5. Exact session/refresh expiry, cleanup and audit retention.
 6. Logout semantics when access token has expired but refresh cookie is present.
 7. Password reset, account lockout and compromised-credential response.
@@ -350,7 +474,7 @@ Use test-only users and tokens. No external service or third-party environment i
 - [ ] Session/token state machines reviewed.
 - [ ] Persistence model reviewed with ARCH-004.
 - [x] CSRF bootstrap/login dependency aligned with SEC-002.2 (design only).
-- [ ] Concurrency, replay and failure cases accepted.
+- [x] Concurrency/replay/lost-response policy documented as proposed (SEC-INT-003); acceptance and tests pending.
 - [ ] Security test matrix approved.
 - [ ] Open decisions tracked in project status.
 

@@ -1,7 +1,7 @@
 # AI PC Builder — CSRF Protection Technical Design
 
 **Document ID:** SEC-002.2  
-**Version:** 1.0  
+**Version:** 1.1.1  
 **Status:** Proposed — Awaiting Review  
 **Repository path:** `docs/04-security/designs/02-csrf-protection-design.md`  
 **Dependencies:** SEC-002.1 Authentication & Session Design; ADR-SEC-002, ADR-SEC-005
@@ -30,18 +30,18 @@ CSRF is relevant where browsers automatically attach credentials (notably cookie
 
 ```mermaid
 flowchart TB
-    U[Legitimate browser]
-    X[Attacker website]
-    P[Next.js application]
-    O[Origin and Fetch Metadata check]
-    C[CSRF verification]
-    A[Auth and session service]
+    U["Legitimate browser"]
+    X["Attacker website"]
+    P["Next.js application"]
+    O["Origin and Fetch Metadata check"]
+    C["CSRF verification"]
+    A["Auth and session service"]
     DB[(PostgreSQL)]
     U --> P
     P -->|CSRF header and eligible cookies| O
     X -->|Forged browser request| O
     O -->|Allowed| C
-    O -->|Rejected| R[403 Forbidden]
+    O -->|Rejected| R["403 Forbidden"]
     C -->|Valid| A
     C -->|Invalid| R
     A --> DB
@@ -208,7 +208,30 @@ For logout, an idempotent user experience is desired, but an unauthenticated cro
 
 Error bodies must not expose CSRF tokens, session hashes, or refresh credentials. Do not differentiate unknown accounts during login.
 
-## 9. Implementation ownership
+## 9. Cross-tab refresh and session recovery (SEC-INT-003)
+
+**Decision:** Keep refresh tokens single-use, rotate atomically, and revoke the affected session/family on confirmed reuse of a consumed token. This may force legitimate re-login after a lost response; it is an explicit MVP trade-off.
+
+**Frontend coordination:** Use same-tab single-flight refresh; optionally coordinate tabs with `BroadcastChannel` and a short-lived best-effort localStorage lease. Neither mechanism is a security boundary. Never broadcast access tokens, refresh tokens, CSRF secrets or credential-bearing responses. Other tabs must independently establish authenticated state.
+
+**Lost response:** A refresh POST may commit even when the response never arrives. Do not blindly retry with the old cookie. On uncertain outcome, require re-login unless a separately reviewed safe recovery protocol exists.
+
+**Reload:** Access JWT and authenticated CSRF token live in memory and disappear on reload. Anonymous `GET /api/v1/auth/csrf` cannot provide a session-bound authenticated CSRF token. MVP defaults to explicit re-login. A future recovery endpoint must prove session ownership, validate Origin, set `Cache-Control: no-store`, and be documented in ARCH-005 before use.
+
+**Server behavior:** Validate Origin/CSRF before mutation; lock the session, re-read refresh token state, commit a single successor. Reject 403 on invalid CSRF without consuming the credential; return generic 401 for expired/revoked/replayed credentials. Never issue credentials before commit.
+
+### 9.1 Additional verification
+
+| ID | Scenario | Expected |
+|---|---|---|
+| SEC-CSRF-015 | Multi-tab simultaneous refresh | At most one rotation commits |
+| SEC-CSRF-016 | Lost response after refresh commit | No blind automatic retry |
+| SEC-CSRF-017 | Page reload without session CSRF in memory | Explicit re-login unless secure recovery contract exists |
+| SEC-CSRF-018 | BroadcastChannel unavailable | Server security unchanged |
+| SEC-CSRF-019 | Broadcast messages inspected | No JWT, cookie, refresh or CSRF secret |
+| SEC-CSRF-020 | Invalid CSRF and valid refresh cookie | 403, token unchanged |
+
+## 10. Implementation ownership
 
 - **Next.js auth client:** fetch bootstrap token, hold CSRF token in memory, send `X-CSRF-Token`, single-flight refresh, clear local state on logout.
 - **NestJS AuthController:** declare cookie-backed endpoints and security requirements.
@@ -218,7 +241,7 @@ Error bodies must not expose CSRF tokens, session hashes, or refresh credentials
 - **PostgreSQL repositories:** persist bootstrap contexts and session CSRF hashes.
 - **Audit service:** emit `security.csrf.validation_failed` without secret values.
 
-## 10. Verification matrix
+## 11. Verification matrix
 
 | Test ID | Scenario | Expected |
 |---|---|---|
@@ -239,23 +262,23 @@ Error bodies must not expose CSRF tokens, session hashes, or refresh credentials
 
 Primary tests: Vitest + Supertest with a real PostgreSQL test database for session/rotation cases. Use browser-level tests for actual cookie, SameSite, and CORS behavior; Supertest alone does not emulate browser cookie rules. Manual Burp Suite Community checks are optional during stabilization.
 
-## 11. Threat traceability
+## 12. Threat traceability
 
 - **THR-015:** CSRF against cookie-authenticated APIs.
 - **THR-014:** Broken authentication/session management.
 - **THR-001:** Object-level authorization is still required after CSRF checks.
 - **THR-012:** Missing auditability; rejected CSRF requests generate safe audit metadata.
 
-## 12. Open decisions
+## 13. Open decisions
 
 1. Confirm production origin topology and cookie host/path.
 2. Confirm exact CSRF token TTL and bootstrap cleanup schedule.
 3. Decide whether to include Fetch Metadata rejection as an enforced or observe-only control.
-4. Finalize retry policy for lost refresh responses and concurrency.
+4. SEC-INT-003 policy defined: no blind retry; session-bound CSRF recovery contract remains unresolved and MVP defaults to re-login.
 5. Determine whether session-bound CSRF hashes are stored directly in `auth_sessions` or a separate table.
 6. Align API response envelope and error-code naming with ARCH-005.
 
-## 13. Definition of done
+## 14. Definition of done
 
 - [ ] Origin and cookie deployment topology confirmed.
 - [ ] Bootstrap and authenticated CSRF flows approved.
