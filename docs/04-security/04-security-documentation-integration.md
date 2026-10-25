@@ -73,34 +73,3 @@ All controls remain **designs**, not verified implementations.
 | `security_audit_events` | Canonical versioned event fields, actor/resource/outcome, sanitized metadata | SEC-002.4 |
 
 Reconcile exact column types, constraints, FK nullability, retention and transactional semantics in ARCH-004. Do not migrate directly from illustrative ERDs.
-
-## 6. Security invariants to carry into ARCH-005
-
-1. A valid JWT from a revoked session is rejected.
-2. Refresh credentials are single-use; rotation is atomic.
-3. Cookie-authenticated state changes require validated Origin and CSRF proof.
-4. Authorization and object ownership checks remain mandatory after authentication.
-5. AI provider requests are constructed only from approved fields and sanitized free text.
-6. Model output cannot change authoritative prices, inventory or payment state.
-7. Critical business mutations and corresponding durable audit records share a transaction.
-8. Secrets, raw tokens, full prompts and payment credentials are excluded from routine logs.
-
-## 7. Exit criteria and current outcome
-
-- [x] Read and compare four available detailed designs.
-- [x] Establish document ownership and dependency map.
-- [x] Record findings, owners and next actions.
-- [x] Define project status and documentation index deliverables.
-- [ ] Verify SEC-001, SEC-002, ADRs and ARCH-004 against repository sources.
-- [ ] Resolve high-priority inconsistencies.
-- [ ] Validate Mermaid rendering.
-- [ ] Approve security design baseline.
-
-**Review outcome:** **Conditional / not yet passed**. Proceed to ARCH-005 only after reconciling the high-priority design/API dependencies; production release remains out of scope.
-
-## 8. Suggested commit
-
-```bash
-git add docs/04-security/04-security-documentation-integration-review.md docs/README.md docs/PROJECT-STATUS.md
-git commit -m "docs(security): review design integration and record project status"
-```
