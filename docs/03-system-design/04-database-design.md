@@ -1,442 +1,214 @@
-# AI PC Builder — Database Design
-
-**Document ID:** ARCH-004  
-**Version:** 1.0 Draft  
-**Status:** Proposed  
-**Database:** PostgreSQL  
-**Architecture:** Modular Monolith  
-**Related Documents:** BA-002, BA-005, ARCH-002, ARCH-003
-
----
-
-## 1. Purpose
-
-Define the logical relational database model for AI PC Builder, including table ownership, relationships, constraints, indexes, and transactional consistency requirements.
-
-This document is a design specification. It is not an executable SQL migration.
-
-## 2. Database Principles
-
-1. PostgreSQL is the primary transactional database.
-2. Each business module owns its data and write operations.
-3. Foreign keys protect referential integrity where applicable.
-4. Unique constraints prevent duplicate identities.
-5. Check constraints protect simple row-level invariants.
-6. Transactions protect multi-row and multi-aggregate consistency.
-7. External provider data is untrusted until validated.
-8. Historical order data must remain stable after catalog changes.
-9. Monetary values must use exact representations.
-10. Database constraints complement, rather than replace, domain validation.
-
-## 3. Identity Tables
-
-### users
-
-| Column | Type | Constraint |
-|---|---|---|
-| id | UUID | PK |
-| email | VARCHAR(255) | NOT NULL, UNIQUE |
-| password_hash | TEXT | Nullable for future external authentication |
-| role | VARCHAR(30) | NOT NULL |
-| status | VARCHAR(30) | NOT NULL |
-| created_at | TIMESTAMPTZ | NOT NULL |
-| updated_at | TIMESTAMPTZ | NOT NULL |
-
-Additional authentication tables, such as sessions or refresh tokens, will be designed when the authentication strategy is selected.
-
-## 4. Catalog Tables
-
-### categories
-
-| Column | Type | Constraint |
-|---|---|---|
-| id | UUID | PK |
-| code | VARCHAR(50) | UNIQUE, NOT NULL |
-| name | VARCHAR(100) | NOT NULL |
-
-### products
-
-| Column | Type | Constraint |
-|---|---|---|
-| id | UUID | PK |
-| category_id | UUID | FK → categories.id |
-| sku | VARCHAR(100) | UNIQUE, NOT NULL |
-| name | TEXT | NOT NULL |
-| status | VARCHAR(30) | NOT NULL |
-| price_vnd | BIGINT | NOT NULL, CHECK >= 0 |
-| created_at | TIMESTAMPTZ | NOT NULL |
-| updated_at | TIMESTAMPTZ | NOT NULL |
-
-### product_specifications
-
-| Column | Type | Constraint |
-|---|---|---|
-| product_id | UUID | PK, FK → products.id |
-| specification_data | JSONB | NOT NULL |
-| schema_version | INTEGER | NOT NULL |
-
-### Design Decision: JSONB Specifications
-
-Hardware categories have different attributes.
-
-Examples:
-
-- CPU: socket, cores, threads, TDP.
-- Motherboard: socket, RAM type, form factor.
-- GPU: length, power consumption.
-- PSU: wattage, connector support.
-- Case: supported form factors, GPU clearance.
-
-The initial design uses category-specific JSONB specifications validated by application schemas.
-
-Frequently queried fields may later receive expression indexes or be normalized into dedicated relational structures.
-
-JSONB must not be used as an excuse to skip validation.
-
-## 5. PC Builder Tables
-
-### pc_configurations
-
-| Column | Type | Constraint |
-|---|---|---|
-| id | UUID | PK |
-| owner_id | UUID | FK → users.id, NOT NULL for persisted configurations |
-| name | VARCHAR(150) | NOT NULL |
-| created_at | TIMESTAMPTZ | NOT NULL |
-| updated_at | TIMESTAMPTZ | NOT NULL |
-
-Temporary guest configurations may initially be held client-side and are not persisted in this table.
-
-### pc_configuration_items
-
-| Column | Type | Constraint |
-|---|---|---|
-| id | UUID | PK |
-| configuration_id | UUID | FK → pc_configurations.id |
-| product_id | UUID | FK → products.id |
-| category_code | VARCHAR(50) | NOT NULL |
-| quantity | INTEGER | CHECK > 0 |
-
-A partial unique index may enforce single-slot component categories.
-
-The exact rule depends on the finalized component quantity policy.
-
-## 6. Cart Tables
-
-### carts
-
-| Column | Type | Constraint |
-|---|---|---|
-| id | UUID | PK |
-| customer_id | UUID | FK → users.id |
-| status | VARCHAR(30) | NOT NULL |
-| created_at | TIMESTAMPTZ | NOT NULL |
-| updated_at | TIMESTAMPTZ | NOT NULL |
-
-### cart_items
-
-| Column | Type | Constraint |
-|---|---|---|
-| id | UUID | PK |
-| cart_id | UUID | FK → carts.id |
-| product_id | UUID | FK → products.id |
-| quantity | INTEGER | CHECK > 0 |
-
-**Unique constraint:** `(cart_id, product_id)`.
-
-Cart prices are not authoritative checkout prices.
-
-## 7. Order Tables
-
-### orders
-
-| Column | Type | Constraint |
-|---|---|---|
-| id | UUID | PK |
-| customer_id | UUID | FK → users.id |
-| status | VARCHAR(30) | NOT NULL |
-| currency | CHAR(3) | NOT NULL |
-| subtotal_amount | BIGINT | NOT NULL, CHECK >= 0 |
-| total_amount | BIGINT | NOT NULL, CHECK >= 0 |
-| checkout_idempotency_key | VARCHAR(150) | NOT NULL |
-| created_at | TIMESTAMPTZ | NOT NULL |
-| updated_at | TIMESTAMPTZ | NOT NULL |
-
-**Unique constraint:** `(customer_id, checkout_idempotency_key)`.
-
-The scope and retention policy of idempotency keys require detailed design.
-
-### order_items
-
-| Column | Type | Constraint |
-|---|---|---|
-| id | UUID | PK |
-| order_id | UUID | FK → orders.id |
-| product_id | UUID | FK → products.id |
-| sku_snapshot | VARCHAR(100) | NOT NULL |
-| name_snapshot | TEXT | NOT NULL |
-| unit_price_amount | BIGINT | NOT NULL, CHECK >= 0 |
-| quantity | INTEGER | CHECK > 0 |
-| line_total_amount | BIGINT | NOT NULL, CHECK >= 0 |
-
-Order item snapshots must remain unchanged when catalog products or prices change.
-
-## 8. Inventory Tables
-
-### inventory_stock
-
-| Column | Type | Constraint |
-|---|---|---|
-| product_id | UUID | PK, FK → products.id |
-| on_hand_quantity | INTEGER | NOT NULL, CHECK >= 0 |
-| reserved_quantity | INTEGER | NOT NULL, CHECK >= 0 |
-| updated_at | TIMESTAMPTZ | NOT NULL |
-
-**Check constraint:**
-
-`reserved_quantity <= on_hand_quantity`
-
-Derived available quantity:
-
-`on_hand_quantity - reserved_quantity`
-
-### inventory_reservations
-
-| Column | Type | Constraint |
-|---|---|---|
-| id | UUID | PK |
-| order_id | UUID | UNIQUE, FK → orders.id |
-| status | VARCHAR(30) | NOT NULL |
-| expires_at | TIMESTAMPTZ | NOT NULL |
-| created_at | TIMESTAMPTZ | NOT NULL |
-| updated_at | TIMESTAMPTZ | NOT NULL |
-
-### inventory_reservation_items
-
-| Column | Type | Constraint |
-|---|---|---|
-| id | UUID | PK |
-| reservation_id | UUID | FK → inventory_reservations.id |
-| product_id | UUID | FK → products.id |
-| quantity | INTEGER | CHECK > 0 |
-
-**Unique constraint:** `(reservation_id, product_id)`.
-
-### Inventory Invariants
-
-- Available inventory must not become negative.
-- A reservation must not be consumed twice.
-- A reservation must not be released twice.
-- Reservation changes and stock updates must be transactionally consistent.
-
-## 9. Payment Tables
-
-### payment_attempts
-
-| Column | Type | Constraint |
-|---|---|---|
-| id | UUID | PK |
-| order_id | UUID | FK → orders.id |
-| provider | VARCHAR(50) | NOT NULL |
-| provider_payment_id | VARCHAR(255) | Nullable until assigned |
-| expected_amount | BIGINT | NOT NULL, CHECK >= 0 |
-| currency | CHAR(3) | NOT NULL |
-| status | VARCHAR(30) | NOT NULL |
-| created_at | TIMESTAMPTZ | NOT NULL |
-| updated_at | TIMESTAMPTZ | NOT NULL |
-
-**Unique constraint:** `(provider, provider_payment_id)` for non-null provider payment IDs.
-
-### payment_events
-
-| Column | Type | Constraint |
-|---|---|---|
-| id | UUID | PK |
-| payment_attempt_id | UUID | Nullable FK → payment_attempts.id |
-| provider | VARCHAR(50) | NOT NULL |
-| provider_event_id | VARCHAR(255) | NOT NULL |
-| event_type | VARCHAR(100) | NOT NULL |
-| processing_status | VARCHAR(30) | NOT NULL |
-| received_at | TIMESTAMPTZ | NOT NULL |
-| processed_at | TIMESTAMPTZ | Nullable |
-
-**Unique constraint:** `(provider, provider_event_id)`.
-
-A processing record must distinguish events successfully handled, ignored as stale, rejected for business validation, and requiring retry.
-
-### refunds
-
-| Column | Type | Constraint |
-|---|---|---|
-| id | UUID | PK |
-| payment_attempt_id | UUID | FK → payment_attempts.id |
-| provider_refund_id | VARCHAR(255) | Nullable |
-| amount | BIGINT | NOT NULL, CHECK > 0 |
-| status | VARCHAR(30) | NOT NULL |
-| created_at | TIMESTAMPTZ | NOT NULL |
-
-Refund amount totals and payment state coordination require transactional validation.
-
-## 10. External Pricing Tables
-
-### sellers
-
-| Column | Type | Constraint |
-|---|---|---|
-| id | UUID | PK |
-| name | VARCHAR(150) | NOT NULL |
-| website_url | TEXT | NOT NULL |
-| status | VARCHAR(30) | NOT NULL |
-
-### seller_offers
-
-| Column | Type | Constraint |
-|---|---|---|
-| id | UUID | PK |
-| seller_id | UUID | FK → sellers.id |
-| catalog_product_id | UUID | Nullable FK → products.id |
-| external_product_key | TEXT | NOT NULL |
-| external_url | TEXT | NOT NULL |
-| match_status | VARCHAR(30) | NOT NULL |
-| latest_price_amount | BIGINT | CHECK >= 0 |
-| currency | CHAR(3) | NOT NULL |
-| last_collected_at | TIMESTAMPTZ | Nullable |
-
-**Unique constraint:** `(seller_id, external_product_key)`.
-
-Unmatched external products must remain representable without a catalog product ID.
-
-### price_observations
-
-| Column | Type | Constraint |
-|---|---|---|
-| id | UUID | PK |
-| seller_offer_id | UUID | FK → seller_offers.id |
-| observed_price_amount | BIGINT | NOT NULL, CHECK >= 0 |
-| observed_at | TIMESTAMPTZ | NOT NULL |
-| collection_job_id | UUID | Nullable FK → data_import_jobs.id |
-
-### data_import_jobs
-
-| Column | Type | Constraint |
-|---|---|---|
-| id | UUID | PK |
-| source | VARCHAR(100) | NOT NULL |
-| status | VARCHAR(30) | NOT NULL |
-| started_at | TIMESTAMPTZ | NOT NULL |
-| finished_at | TIMESTAMPTZ | Nullable |
-| error_summary | TEXT | Nullable |
-
-## 11. Index Strategy
-
-Initial candidate indexes:
-
-| Table | Index | Purpose |
-|---|---|---|
-| products | `(category_id, status)` | Category browsing |
-| products | `(sku)` UNIQUE | Product identity |
-| pc_configurations | `(owner_id, updated_at)` | Saved builds |
-| orders | `(customer_id, created_at)` | Order history |
-| orders | `(customer_id, checkout_idempotency_key)` UNIQUE | Checkout idempotency |
-| inventory_reservations | `(status, expires_at)` | Reservation expiration |
-| payment_attempts | `(order_id, created_at)` | Payment history |
-| payment_events | `(provider, provider_event_id)` UNIQUE | Webhook idempotency |
-| seller_offers | `(catalog_product_id, match_status)` | Price comparison |
-| price_observations | `(seller_offer_id, observed_at)` | Price history |
-
-Indexes must be validated against actual query patterns and execution plans.
-
-Avoid adding indexes to every column without evidence.
-
-## 12. Concurrency Control
-
-### Problem: Overselling
-
-Two customers may attempt to reserve the final available unit concurrently.
-
-A separate read-then-write operation is insufficient.
-
-### Proposed Approach
-
-Use a conditional inventory update within a PostgreSQL transaction.
-
-Conceptual SQL:
-
-```sql
-UPDATE inventory_stock
-SET reserved_quantity = reserved_quantity + $1
-WHERE product_id = $2
-  AND on_hand_quantity - reserved_quantity >= $1
-RETURNING product_id;
+# ARCH-004 — Security Persistence Integration (SEC-INT-002)
+
+**Project:** AI PC Builder Platform
+**Status:** Proposed design delta — not a migration or implemented database
+**Reviewed against:** GitHub `main` on 2026-10-25: ARCH-004, SEC-002.1 v1.0.2, SEC-002.2 v1.0, SEC-002.4 v1.0.
+**Integration target:** Insert this content into `docs/03-system-design/04-database-design.md`, after its existing `users` table, then merge the index/transaction/open-decision sections. Do not maintain this as a competing canonical schema.
+
+## 1. Purpose and authority
+
+The existing ARCH-004 defines `users` but defers session storage. The detailed security designs now require four additional PostgreSQL tables. ARCH-004 is the canonical relational schema; SEC-002.1 owns session behavior, SEC-002.2 owns CSRF behavior, and SEC-002.4 owns audit event semantics.
+
+**Scope:** Identity sessions, refresh rotation, anonymous login-CSRF bootstrap, and durable security audit events. No new Redis dependency. All constraints below are **proposed**, subject to migration and integration testing.
+
+## 2. Relational model
+
+```mermaid
+erDiagram
+    USERS ||--o{ AUTH_SESSIONS : owns
+    AUTH_SESSIONS ||--o{ REFRESH_TOKEN_RECORDS : rotates
+    USERS ||--o{ SECURITY_AUDIT_EVENTS : may_act
+    AUTH_SESSIONS {
+        uuid id PK
+        uuid user_id FK
+        uuid token_family_id
+        uuid current_refresh_token_id
+        varchar csrf_token_hash
+        timestamptz csrf_issued_at
+        timestamptz created_at
+        timestamptz expires_at
+        timestamptz revoked_at
+    }
+    REFRESH_TOKEN_RECORDS {
+        uuid id PK
+        uuid session_id FK
+        varchar token_hash UK
+        varchar status
+        timestamptz issued_at
+        timestamptz expires_at
+        timestamptz consumed_at
+        uuid replaced_by_token_id
+    }
+    CSRF_BOOTSTRAP_CONTEXTS {
+        uuid id PK
+        varchar token_hash
+        timestamptz created_at
+        timestamptz expires_at
+        timestamptz consumed_at
+    }
+    SECURITY_AUDIT_EVENTS {
+        uuid id PK
+        varchar schema_version
+        timestamptz occurred_at
+        varchar event_name
+        varchar outcome
+        varchar actor_type
+        uuid actor_id
+        jsonb metadata
+    }
 ```
 
-If no row is returned, the reservation fails.
+**Note:** `security_audit_events.actor_id` is a logical user reference rather than a required foreign key. This preserves anonymous/provider events and avoids accidental deletion of audit history. Audit has no required session FK; session ID may be an allowlisted reference in a future schema revision, not a second canonical audit model.
 
-For multiple products:
+## 3. Tables and constraints
 
-1. Use one database transaction.
-2. Lock or update stock rows in a consistent order.
-3. Create the reservation records.
-4. Create the order.
-5. Commit only if all operations succeed.
+### 3.1 `auth_sessions` — Identity module
 
-This prevents partial reservations and reduces deadlock risk.
+| Column | PostgreSQL type | Constraint / meaning |
+|---|---|---|
+| `id` | UUID | Primary key |
+| `user_id` | UUID | NOT NULL, FK `users(id)` with `ON DELETE RESTRICT` for MVP |
+| `token_family_id` | UUID | NOT NULL; family identity for replay/revocation |
+| `current_refresh_token_id` | UUID | NULL initially during creation; FK added after refresh table creation |
+| `csrf_token_hash` | TEXT | NOT NULL; hash of session-bound CSRF token |
+| `csrf_issued_at` | TIMESTAMPTZ | NOT NULL |
+| `created_at` | TIMESTAMPTZ | NOT NULL |
+| `expires_at` | TIMESTAMPTZ | NOT NULL; absolute expiry |
+| `revoked_at` | TIMESTAMPTZ | NULL unless revoked |
+| `revocation_reason` | VARCHAR(80) | NULL; controlled reason code |
+| `last_used_at` | TIMESTAMPTZ | NULL |
 
-## 13. Data Integrity Strategy
+Constraints: `expires_at > created_at`; `revoked_at IS NULL OR revoked_at >= created_at`. `current_refresh_token_id` must refer to a token **belonging to the same session**; enforce via composite FK `(id, current_refresh_token_id)` -> `refresh_token_records(session_id,id)` or equivalent transaction-safe validation. A simple FK on token ID alone is insufficient.
 
-### Database Constraints
+Indexes: `(user_id, revoked_at, expires_at)` for active-session lookup; `(expires_at)` for cleanup. Primary keys already have indexes.
 
-Use for:
+### 3.2 `refresh_token_records` — Identity module
 
-- Primary keys.
-- Foreign keys.
-- Unique identities.
-- Non-negative amounts.
-- Positive quantities.
-- Basic stock bounds.
+| Column | PostgreSQL type | Constraint / meaning |
+|---|---|---|
+| `id` | UUID | Primary key |
+| `session_id` | UUID | NOT NULL, FK `auth_sessions(id)` |
+| `token_hash` | TEXT | NOT NULL, UNIQUE; never plaintext |
+| `status` | VARCHAR(20) | NOT NULL; `CURRENT`, `CONSUMED`, `REVOKED` |
+| `issued_at` | TIMESTAMPTZ | NOT NULL |
+| `expires_at` | TIMESTAMPTZ | NOT NULL |
+| `consumed_at` | TIMESTAMPTZ | NULL |
+| `replaced_by_token_id` | UUID | NULL, self-referencing FK |
 
-### Domain Validation
+Constraints: `expires_at > issued_at`; `status = 'CONSUMED'` requires `consumed_at IS NOT NULL`; `replaced_by_token_id <> id` when present. Enforce `UNIQUE(session_id,id)` to support the composite current-token FK. A partial unique index on `(session_id) WHERE status = 'CURRENT'` ensures at most one current token per session.
 
-Use for:
+**Circular FK migration:** Create `auth_sessions` without the current-token FK, create `refresh_token_records`, then add the composite FK. For session creation, insert session with `current_refresh_token_id=NULL`, insert refresh record, update session current pointer, all in **one transaction**. Use a `DEFERRABLE` constraint if required by the chosen insertion order. Do not expose an incompletely initialized session before commit.
 
-- Compatibility rules.
-- Order state transitions.
-- Payment state transitions.
-- Category-specific specifications.
-- Reservation lifecycle rules.
+**Token hashes:** Use keyed HMAC-SHA-256 or a cryptographically appropriate token hash with an application-managed secret; random opaque tokens must have sufficient entropy. Do not store plaintext tokens or log token hashes. Secret rotation needs a versioning policy before implementation.
 
-### Transactions
+### 3.3 `csrf_bootstrap_contexts` — Identity/CSRF module
 
-Use for:
+| Column | PostgreSQL type | Constraint / meaning |
+|---|---|---|
+| `id` | UUID | Primary key; unguessable context identifier in secure bootstrap cookie |
+| `token_hash` | TEXT | NOT NULL; server-side hash only |
+| `created_at` | TIMESTAMPTZ | NOT NULL |
+| `expires_at` | TIMESTAMPTZ | NOT NULL |
+| `consumed_at` | TIMESTAMPTZ | NULL until successful bootstrap consumption |
 
-- Order creation and stock reservation.
-- Reservation release and stock update.
-- Payment confirmation and coordinated order transitions.
-- Idempotent webhook processing.
+Constraints: `expires_at > created_at`; `consumed_at IS NULL OR consumed_at >= created_at`. Index `(expires_at)` for TTL cleanup. On login, verify Origin + bootstrap cookie + CSRF header, lock context row, ensure not expired/consumed, validate credentials, and consume bootstrap atomically with creation of session and refresh credential. Failure-path consumption policy (invalid password, throttling) must be finalized in SEC-002.2 before implementation. The bootstrap cookie is not an authenticated session.
 
-## 14. Open Decisions
+### 3.4 `security_audit_events` — Audit module
 
-1. ORM choice and migration tooling.
-2. Authentication storage strategy.
-3. Product specification schema and indexing.
-4. Reservation expiration policy.
-5. Payment retry and late-payment handling.
-6. Order cancellation and refund inventory effects.
-7. Soft-delete and archival policies.
-8. Search implementation.
-9. Data retention and privacy policies.
+**Canonical fields from SEC-002.4** (not the illustrative four-field entity in SEC-002.1):
 
-## 15. Definition of Done
+| Column | PostgreSQL type | Constraint |
+|---|---|---|
+| `id` | UUID | PK |
+| `schema_version` | VARCHAR(20) | NOT NULL, initially `1.0` |
+| `occurred_at` | TIMESTAMPTZ | NOT NULL |
+| `event_name` | VARCHAR(160) | NOT NULL |
+| `event_category` | VARCHAR(40) | NOT NULL |
+| `outcome` | VARCHAR(20) | NOT NULL; `success`, `failure`, `denied`, `unknown` |
+| `severity` | VARCHAR(10) | NOT NULL; `DEBUG`, `INFO`, `WARN`, `ERROR` |
+| `service_name` | VARCHAR(100) | NOT NULL |
+| `actor_type` | VARCHAR(20) | NOT NULL; `customer`, `admin`, `system`, `anonymous`, `provider` |
+| `actor_id` | UUID | NULL; logical reference, no enforced FK in MVP |
+| `resource_type` | VARCHAR(100) | NULL |
+| `resource_id` | VARCHAR(255) | NULL |
+| `request_id` | VARCHAR(150) | NULL |
+| `trace_id` | VARCHAR(150) | NULL |
+| `reason_code` | VARCHAR(100) | NULL |
+| `metadata` | JSONB | NOT NULL DEFAULT '{}'::jsonb, must be an object |
 
-- Core tables are identified.
-- Primary and foreign keys are defined.
-- Ownership aligns with module boundaries.
-- Critical uniqueness constraints are identified.
-- Inventory concurrency strategy is documented.
-- Payment event idempotency is supported.
-- Historical price snapshots are preserved.
-- Open implementation decisions are recorded.
+Indexes: `(occurred_at DESC)`, `(event_name,occurred_at DESC)`, `(actor_id,occurred_at DESC)` where actor_id non-null, `(resource_type,resource_id,occurred_at DESC)` for resource investigations, `(request_id)` where non-null. These are **candidates**, to prune after actual query patterns.
 
----
+The table is append-only via application roles. Only controlled retention processes may delete. Metadata is event-specific allowlisted data; never store passwords, tokens, cookie headers, raw prompts, payment credentials, request bodies, or full addresses. Audit retention duration and access approval remain open.
 
-**Status:** Awaiting Architecture Review.
+## 4. Transaction boundaries and concurrency
+
+```mermaid
+sequenceDiagram
+    participant Browser
+    participant API as NestJS
+    participant DB as PostgreSQL
+    Browser->>API: POST refresh with cookie and CSRF
+    API->>DB: BEGIN and SELECT session FOR UPDATE
+    DB-->>API: Session and current token
+    API->>API: Validate CSRF and token hash
+    alt Valid current token
+        API->>DB: Mark consumed and insert successor
+        API->>DB: Update current pointer and insert audit event
+        API->>DB: COMMIT
+        API-->>Browser: New cookie and access token
+    else Consumed token reuse
+        API->>DB: Revoke session and token family
+        API->>DB: Insert replay audit event and COMMIT
+        API-->>Browser: 401 reauthentication required
+    else Unknown or expired
+        API->>DB: ROLLBACK or no-op
+        API-->>Browser: 401 no credentials issued
+    end
+```
+
+- **Login:** one transaction for bootstrap consumption, session creation, initial refresh hash and critical audit event; do not commit partial session state.
+- **Refresh:** lock session, validate that submitted hash identifies the current token, consume it once, insert successor, change current pointer, and commit together.
+- **Replay:** previously consumed token is never accepted. Confirmed replay revokes affected session/family per SEC-002.1; cross-tab duplicate/lost-response may trigger re-login. Browser single-flight and multi-tab coordination remain required.
+- **Logout:** session revocation, token invalidation and durable audit event in one transaction; clear cookie in response.
+- **Critical admin mutations:** business mutation and durable audit insert in same database transaction, when within the same database.
+- **Operational failures:** database outage fails closed for session validation and critical authenticated mutations. Logging errors must not expose secrets.
+
+## 5. Migration plan (design, not executed)
+
+1. Confirm ORM/migration tool and naming conventions.
+2. Add `auth_sessions`, `refresh_token_records`, composite FK/current-pointer and relevant constraints.
+3. Add `csrf_bootstrap_contexts`.
+4. Add canonical `security_audit_events` and audit insert-only privileges.
+5. Implement repositories and transaction tests; do not seed or log real tokens.
+6. Validate referential integrity, rollback, expiration cleanup and index usage with PostgreSQL.
+7. Update SEC-002.1 illustrative ERD notes to point to ARCH-004 as canonical.
+
+## 6. Verification checklist
+
+| Test | Required outcome |
+|---|---|
+| Session references missing user | FK rejects |
+| Session current token belongs to another session | Composite FK rejects |
+| Two CURRENT refresh records for one session | Partial unique index rejects |
+| Two concurrent refresh requests | At most one rotation commits |
+| Refresh transaction fails midway | No consumed token without successor |
+| Consumed refresh token replayed | No token issued; affected session revoked |
+| Expired bootstrap context | Login rejected; no session created |
+| Bootstrap consumed twice | Second login attempt rejected |
+| Logout transaction fails | No partial revocation reported successful |
+| Audit insert fails in critical mutation | Critical mutation rolled back |
+| Anonymous/provider audit event | Can persist without `users` FK |
+| Sensitive metadata supplied | Application rejects or strips before persistence |
+| Retention cleanup | Only expired/eligible records removed per approved policy |
+
+## 7. Unresolved decisions
+
+- **SEC-DB-001:** Refresh token hashing and key rotation policy.
+- **SEC-DB-002:** Bootstrap context behavior on invalid login credentials.
+- **SEC-DB-003:** Cross-tab refresh and lost-response UX; replay false positives.
+- **SEC-DB-004:** Audit retention duration, access roles, archival/deletion.
+- **SEC-DB-005:** Final migration/ORM tooling.
+- **SEC-DB-006:** User deletion policy versus long-lived session/audit references.
+- **SEC-DB-007:** Session expiration cleanup cadence and replay detection retention.
+
+**Definition of Done for this design checkpoint:** ARCH-004 contains one consolidated schema, diagrams and constraints are consistent with SEC-002.1/002.2/002.4, open decisions remain explicit, and the Markdown/Mermaid render is validated. No application implementation is implied.
